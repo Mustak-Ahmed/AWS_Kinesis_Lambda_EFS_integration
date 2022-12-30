@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Amazon Kinesis, Lambda and EFS integration.
+
+Parameters:
+
+  LambdaConsumerName: 
+    Type: String
+    Default: 'architect-datafeed-driver-file-process'
+  
+  LambdaproducerName: 
+    Type: String
+    Default: 'adf-file-generator'
+
+  ConcurrentExecution:
+    Type: String
+    Default: 0
+
+  Memorysize:
+    Type: String
+    Default: 1024
+
+  Time:
+    Type: String
+    Default: 600
+
+  EventBusName: 
+    Type: String
+    Default: "architect-datafeed"
+
+  EventRuleName: 
+    Type: String
+    Default:  "start-datafeed"
+
+  DBpolicy:
+    Type: String
+    Default: "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+
+  Kinesispolicy:
+    Type: String
+    Default: "arn:aws:iam::aws:policy/AmazonKinesisFullAccess"
+  
+  Eventbgpolicy:
+    Type: String
+    Default: "arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess"
+
+  S3policy:
+    Type: String
+    Default: "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+
+  S3policy:
+    Type: String
+    Default: "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+
+  EFSpolicy:
+    Type: String
+    Default: "arn:aws:iam::aws:policy/AmazonElasticFileSystemFullAccess"
+
+  StreamName:
+    Type: String
+    Default: "datafeed"
+
+  Source:
+    Type: String
+    Default: "net.atpco.architect"
+
+  Detail:
+    Type: String
+    Default: "start-datafeed-event"
+
+  
+  
+
+
+  
+  
+
+Resources:
+  HelloLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ConsumerLambdaRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - !Ref DBpolicy
+        - !Ref Eventbgpolicy
+        - !Ref Kinesispolicy
+      Path: /
+                
+
+  ConsumerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaConsumerName
+      Role: !GetAtt HelloLambdaRole.Arn
+      Runtime: python3.9
+      MemorySize: !Ref Memorysize
+      Timeout: !Ref Time
+      ReservedConcurrentExecutions: !Ref ConcurrentExecution
+      Handler: index.my_handler
+      Code:
+        ZipFile: |
+          def my_handler(event, context):
+            message = 'Hello Lambda World!'
+            return message
+    
+  SampleCustomEventBus: 
+    Type: AWS::Events::EventBus
+    Properties: 
+        Name: !Ref EventBusName
+      
+  myeventrule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: !Ref EventRuleName
+      EventBusName: !GetAtt SampleCustomEventBus.Arn
+      # EventPattern: 
+      #   account: [!Ref AWS::AccountId]
+      EventPattern:
+        {
+          "detail-type": [!Ref Detail],
+          "source": [!Ref Source],
+          "account": [!Ref AWS::AccountId]
+        }
+
+      Name: !Ref EventRuleName
+      State: ENABLED
+      Targets:
+       - 
+         Arn: 
+           Fn::GetAtt:
+             - "ConsumerLambdaFunction"
+             - "Arn"
+         Id: "idmyeventrule"
+         
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "ConsumerLambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "myeventrule"
+          - "Arn"  
+
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties: 
+      Name: !Ref StreamName
+      RetentionPeriodHours: 24
+      ShardCount: 2
+      StreamModeDetails: 
+        StreamMode: PROVISIONED
+      
+  ProducerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ProducerLambdaRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess
+        - arn:aws:iam::aws:policy/AmazonVPCFullAccess
+        - !Ref Kinesispolicy
+      Path: /
+
+  ProducerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaproducerName
+      Environment:
+        Variables:
+          name: !Ref StreamName
+      Role: !GetAtt ProducerLambdaRole.Arn
+      Runtime: python3.9
+      ReservedConcurrentExecutions: !Ref ConcurrentExecution
+      VpcConfig:
+        SecurityGroupIds:
+        - Ref: EfsSecurityGroup
+        SubnetIds:
+        - Ref: Subnet1
+      FileSystemConfigs:
+      - Arn: !GetAtt AccessPoint.Arn
+        LocalMountPath: "/mnt/efs"
+      Description: Use a file system. 
+      MemorySize: !Ref Memorysize
+      Timeout: !Ref Time
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import uuid
+
+          def lambda_handler(event, context):
+              client = boto3.client('kinesis')
+              
+              response = client.put_record(
+                  StreamName=os.getenv('name'),
+                  Data=json.dumps(event),
+                  PartitionKey=str(uuid.uuid4())
+              )
+              
+              print(response)
+    DependsOn: "MountTarget1"
+
+  PermissionForKinesisToInvokeLambda: 
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: 
+      BatchSize: 100
+      BisectBatchOnFunctionError: No
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 10
+      MaximumRecordAgeInSeconds: -1
+      FunctionName: 
+        Ref: "ConsumerLambdaFunction"
+      Enabled: True
+      EventSourceArn: 
+        Fn::GetAtt: 
+          - "KinesisStream"
+          - "Arn" 
+      MaximumRetryAttempts: 0 
+      StartingPosition: "TRIM_HORIZON"
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: "ap-south-1a"
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        Ref: VPC
+      GroupDescription: "mnt target sg"
+      SecurityGroupIngress:
+      - IpProtocol: -1
+        CidrIp: "0.0.0.0/0"
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      Encrypted: True
+      FileSystemTags:
+      - Key: "Name"
+        Value: "efs"
+
+  AccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId:
+        Ref: FileSystem
+      PosixUser:
+        Uid: "1001"
+        Gid: "1001"
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: "1001"
+          OwnerUid: "1001"
+          Permissions: "755"
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId:
+        Ref: FileSystem
+      SubnetId:
+        Ref: Subnet1
+      SecurityGroups:
+      - Ref: EfsSecurityGroup
+      
+
+    
